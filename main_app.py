@@ -5,14 +5,14 @@ from prophet import Prophet
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
 import xgboost as xgb
 import lightgbm as lgb
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 import plotly.graph_objects as go
 import holidays
-from datetime import date
+from datetime import date, timedelta
 
 # --- Configuración de la página de Streamlit ---
 st.set_page_config(page_title="Predicción TRM Dólar Colombia", layout="wide", initial_sidebar_state="expanded")
@@ -23,7 +23,6 @@ st.set_page_config(page_title="Predicción TRM Dólar Colombia", layout="wide", 
 def load_data(file):
     """Carga y preprocesa los datos del archivo CSV."""
     df = pd.read_csv(file)
-    # Limpieza de nombres de columna (eliminar espacios)
     df.columns = df.columns.str.strip()
     df = df.rename(columns={'VIGENCIADESDE': 'fecha', 'VALOR': 'valor'})
     df['fecha'] = pd.to_datetime(df['fecha'], format='%d/%m/%Y')
@@ -32,18 +31,18 @@ def load_data(file):
     df['centavos'] = (df['valor'] - np.floor(df['valor'])) * 100
     return df
 
-def get_colombian_holidays(year):
-    """Obtiene los festivos de Colombia para un año específico."""
-    return holidays.Colombia(years=year)
+def get_colombian_holidays(year_list):
+    """Obtiene los festivos de Colombia para una lista de años."""
+    return holidays.Colombia(years=year_list)
 
 def add_features(df):
     """Agrega características de ingeniería de tiempo al DataFrame."""
+    colombian_holidays = get_colombian_holidays(df['fecha'].dt.year.unique())
     df['dia_semana'] = df['fecha'].dt.dayofweek
     df['dia_mes'] = df['fecha'].dt.day
     df['mes'] = df['fecha'].dt.month
     df['anio'] = df['fecha'].dt.year
-    df['festivo'] = df['fecha'].apply(lambda x: x in get_colombian_holidays(x.year)).astype(int)
-    # Lags y promedios móviles
+    df['festivo'] = df['fecha'].apply(lambda x: x in colombian_holidays).astype(int)
     for lag in [1, 5, 10]:
         df[f'valor_lag_{lag}'] = df['valor'].shift(lag)
         df[f'centavos_lag_{lag}'] = df['centavos'].shift(lag)
@@ -51,7 +50,7 @@ def add_features(df):
     df = df.dropna().reset_index(drop=True)
     return df
 
-# --- Funciones de Entrenamiento de Modelos ---
+# --- Funciones de Entrenamiento y Evaluación ---
 
 def train_ml_model(df, model_type='RandomForest', target='valor'):
     """Entrena un modelo de Machine Learning (RF, XGB, LGBM, LR)."""
@@ -60,7 +59,6 @@ def train_ml_model(df, model_type='RandomForest', target='valor'):
     df_train = df_train.dropna()
 
     features = [col for col in df_train.columns if col not in ['fecha', 'target', 'valor', 'centavos']]
-    
     X = df_train[features]
     y = df_train['target']
 
@@ -70,165 +68,165 @@ def train_ml_model(df, model_type='RandomForest', target='valor'):
         model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, random_state=42)
     elif model_type == 'LightGBM':
         model = lgb.LGBMRegressor(objective='regression', n_estimators=100, random_state=42)
-    else: # Regresión Lineal
+    else:
         model = LinearRegression()
 
     model.fit(X, y)
     return model, features
 
-def create_dataset_for_lstm(dataset, look_back=10):
-    """Crea secuencias para el modelo LSTM."""
-    dataX, dataY = [], []
-    for i in range(len(dataset) - look_back - 1):
-        a = dataset[i:(i + look_back), 0]
-        dataX.append(a)
-        dataY.append(dataset[i + look_back, 0])
-    return np.array(dataX), np.array(dataY)
+# --- Nueva Función para Encontrar el Mejor Modelo ---
+@st.cache_data
+def find_best_model(data_featured):
+    """Evalúa varios modelos y devuelve el mejor basado en MAPE."""
+    models_to_evaluate = ['Random Forest', 'XGBoost', 'LightGBM', 'Regresión Lineal']
+    performance = {}
 
-def train_lstm_model(df, look_back=10):
-    """Entrena un modelo LSTM."""
-    dataset = df['valor'].values.reshape(-1, 1)
-    X, y = create_dataset_for_lstm(dataset, look_back)
-    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+    train_data, test_data = train_test_split(data_featured, test_size=0.2, shuffle=False)
     
-    model = Sequential()
-    model.add(LSTM(50, return_sequences=True, input_shape=(look_back, 1)))
-    model.add(LSTM(50))
-    model.add(Dense(1))
-    model.compile(loss='mean_squared_error', optimizer='adam')
-    model.fit(X, y, epochs=20, batch_size=32, verbose=0)
-    return model
+    for model_name in models_to_evaluate:
+        model_eval, features_eval = train_ml_model(train_data, model_name, target='valor')
+        
+        # Asegurarse de que X_test tenga las mismas dimensiones que los datos de entrenamiento
+        X_test = test_data.shift(1).dropna()[features_eval]
+        y_test = test_data.iloc[1:]['valor']
+        
+        # Alinear y_test con X_test
+        y_test = y_test.tail(len(X_test))
+
+        if not X_test.empty:
+            predictions = model_eval.predict(X_test)
+            mape = mean_absolute_percentage_error(y_test, predictions) * 100
+            performance[model_name] = mape
+
+    if not performance:
+        return None, None
+
+    best_model_name = min(performance, key=performance.get)
+    min_error = performance[best_model_name]
+    
+    return best_model_name, min_error
 
 # --- Interfaz de Streamlit ---
 
 st.title('💵 Predicción Avanzada de la TRM del Dólar en Colombia')
 
-# --- Instrucciones de Uso ---
-with st.expander("Ver Instrucciones de Uso", expanded=True):
+with st.expander("Ver Instrucciones de Uso", expanded=False):
     st.markdown("""
-    **¡Bienvenido al predictor de la TRM! Sigue estos sencillos pasos:**
-
-    1.  **Carga tus Datos**: Haz clic en el botón "Cargar archivo" y selecciona tu archivo CSV con el histórico de la TRM. El formato debe ser el proporcionado por el Banco de la República.
-    2.  **Configura la Predicción**: En la barra lateral izquierda, elige el modelo de predicción que deseas utilizar. Tienes desde modelos clásicos hasta redes neuronales (LSTM).
-    3.  **Realiza la Predicción**: Presiona el botón "Realizar Predicción". La aplicación calculará y mostrará el valor estimado de la TRM y los centavos para el siguiente día hábil.
-    4.  **Analiza los Resultados**: Revisa las métricas y las gráficas para entender la predicción.
-    5.  **Evalúa el Desempeño (Opcional)**: Si quieres saber qué tan preciso es el modelo, despliega la sección "Evaluar Desempeño de los Modelos" en la parte inferior. Verás métricas de error y una comparación gráfica entre los valores reales y los predichos.
+    1.  **Carga tus Datos**: Sube tu archivo CSV con el histórico de la TRM.
+    2.  **Selecciona el Rango de Entrenamiento**: En la barra lateral, elige las fechas de inicio y fin para entrenar los modelos. **Necesitas al menos 30 días de datos.**
+    3.  **Obtén una Recomendación**: Haz clic en "Sugerir Mejor Modelo" para que la app analice y te diga cuál modelo tiene el menor error para el rango de fechas seleccionado.
+    4.  **Configura y Realiza la Predicción**: Elige el modelo que prefieras (¡quizás el recomendado!) y presiona "Realizar Predicción".
+    5.  **Analiza y Evalúa**: Revisa los resultados y, si quieres, explora la sección de "Evaluar Desempeño" para un análisis más profundo.
     """)
 
-# --- Carga de datos ---
 uploaded_file = st.file_uploader("Carga tu archivo CSV con el histórico de la TRM", type="csv")
 
 if uploaded_file is not None:
     data_raw = load_data(uploaded_file)
-    data_featured = add_features(data_raw.copy())
 
     # --- Sidebar de Opciones ---
-    st.sidebar.header('⚙️ Configuración de Predicción')
-    model_choice = st.sidebar.selectbox(
-        'Elige un modelo de predicción:',
-        ('Random Forest', 'XGBoost', 'LightGBM', 'LSTM', 'Prophet', 'Regresión Lineal')
-    )
-
-    # --- Mostrar Últimos Datos ---
-    st.subheader('Últimos 15 Días Registrados de la TRM')
-    last_15_days = data_raw.tail(15).sort_values('fecha', ascending=False).reset_index(drop=True)
-    st.dataframe(last_15_days[['fecha', 'valor']].style.format({'valor': '{:,.2f}'}), use_container_width=True)
-
-    st.markdown("---")
-
-    # --- Sección de Predicción ---
-    st.header(f'🔮 Resultados de la Predicción con {model_choice}')
+    st.sidebar.header('⚙️ Configuración de Entrenamiento y Predicción')
     
-    if st.button('Realizar Predicción'):
-        with st.spinner('Entrenando modelos y realizando predicciones... ¡Esto puede tardar un momento!'):
-            # --- Predicción del Valor Completo de la TRM ---
-            if model_choice == 'Prophet':
-                model_trm = Prophet().fit(data_raw.rename(columns={'fecha': 'ds', 'valor': 'y'}))
-                future = model_trm.make_future_dataframe(periods=1)
-                forecast = model_trm.predict(future)
-                predicted_trm = forecast['yhat'].iloc[-1]
-            elif model_choice == 'LSTM':
-                model_trm = train_lstm_model(data_raw)
-                last_data_points = data_raw['valor'].values[-10:].reshape(1, 10, 1)
-                predicted_trm = model_trm.predict(last_data_points)[0][0]
-            else:
+    # --- Selección de Rango de Fechas ---
+    min_date = data_raw['fecha'].min().date()
+    max_date = data_raw['fecha'].max().date()
+
+    start_date = st.sidebar.date_input('Fecha de inicio para entrenamiento', min_date, min_value=min_date, max_value=max_date)
+    end_date = st.sidebar.date_input('Fecha de fin para entrenamiento', max_date, min_value=start_date, max_value=max_date)
+
+    # Filtrar datos según el rango seleccionado
+    training_data = data_raw[(data_raw['fecha'].dt.date >= start_date) & (data_raw['fecha'].dt.date <= end_date)]
+
+    if len(training_data) < 30:
+        st.sidebar.warning(f"El rango seleccionado contiene solo {len(training_data)} registros. Por favor, selecciona un rango con al menos 30 registros para un entrenamiento confiable.")
+    else:
+        st.sidebar.success(f"Rango seleccionado contiene {len(training_data)} registros para entrenar.")
+        data_featured = add_features(training_data.copy())
+
+        # --- Sugerencia de Modelo ---
+        if st.sidebar.button('Sugerir Mejor Modelo'):
+            with st.spinner('Analizando modelos...'):
+                best_model, min_error = find_best_model(data_featured)
+                if best_model:
+                    st.sidebar.success(f"🏆 **Recomendado:**\n**{best_model}**\n(Error: {min_error:.2f}%)")
+                else:
+                    st.sidebar.error("No se pudo determinar el mejor modelo. Intenta con un rango de fechas más amplio.")
+
+        model_choice = st.sidebar.selectbox(
+            'Elige un modelo de predicción:',
+            ('Random Forest', 'XGBoost', 'LightGBM', 'Regresión Lineal'), # Simplificado para la recomendación
+            help="Elige el modelo para realizar la predicción. Usa el botón de sugerencia para una recomendación."
+        )
+
+        st.subheader(f'Datos de Entrenamiento: {start_date.strftime("%d/%m/%Y")} al {end_date.strftime("%d/%m/%Y")}')
+        
+        st.markdown("---")
+
+        # --- Sección de Predicción ---
+        st.header(f'🔮 Resultados de la Predicción con {model_choice}')
+        
+        if st.button('Realizar Predicción'):
+            with st.spinner('Entrenando y prediciendo...'):
+                # Predicción TRM
                 model_trm, features_trm = train_ml_model(data_featured, model_choice, target='valor')
                 prediction_input = data_featured[features_trm].tail(1)
                 predicted_trm = model_trm.predict(prediction_input)[0]
 
-            # --- Predicción Específica de Centavos ---
-            # Usaremos un modelo robusto como LightGBM para los centavos
-            model_cents, features_cents = train_ml_model(data_featured, 'LightGBM', target='centavos')
-            prediction_input_cents = data_featured[features_cents].tail(1)
-            predicted_cents = model_cents.predict(prediction_input_cents)[0]
-            # Asegurarse que los centavos estén en el rango [0, 99]
-            predicted_cents = max(0, min(99.99, predicted_cents))
+                # Predicción Centavos
+                model_cents, features_cents = train_ml_model(data_featured, 'LightGBM', target='centavos')
+                prediction_input_cents = data_featured[features_cents].tail(1)
+                predicted_cents = model_cents.predict(prediction_input_cents)[0]
+                predicted_cents = max(0, min(99.99, predicted_cents))
 
-            # --- Mostrar Resultados ---
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric(
-                    label=f"Predicción TRM (Valor Completo)",
-                    value=f"${predicted_trm:,.2f}",
-                    help="Valor estimado del dólar para el siguiente día hábil."
-                )
-            with col2:
-                st.metric(
-                    label="Predicción de Centavos",
-                    value=f"{predicted_cents:.2f} ¢",
-                    help="Estimación específica de la porción de centavos de la TRM."
-                )
-            
-            # --- Gráfica de Tendencia con Predicción ---
-            st.subheader('Tendencia Histórica y Punto de Predicción')
-            fig_hist = go.Figure()
-            fig_hist.add_trace(go.Scatter(x=data_raw['fecha'], y=data_raw['valor'], mode='lines', name='TRM Histórica'))
-            # Añadir el punto de predicción
-            next_day = data_raw['fecha'].iloc[-1] + pd.Timedelta(days=1)
-            fig_hist.add_trace(go.Scatter(x=[next_day], y=[predicted_trm], mode='markers', name='Predicción', 
-                                          marker=dict(color='red', size=12, symbol='star')))
-            fig_hist.update_layout(title='Histórico de la TRM y Valor Predicho', xaxis_title='Fecha', yaxis_title='Valor (COP)')
-            st.plotly_chart(fig_hist, use_container_width=True)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(label=f"Predicción TRM (Valor Completo)", value=f"${predicted_trm:,.2f}")
+                with col2:
+                    st.metric(label="Predicción de Centavos", value=f"{predicted_cents:.2f} ¢")
+                
+                st.subheader('Tendencia Histórica y Punto de Predicción')
+                fig_hist = go.Figure()
+                fig_hist.add_trace(go.Scatter(x=training_data['fecha'], y=training_data['valor'], mode='lines', name='TRM Histórica (Entrenamiento)'))
+                next_day = training_data['fecha'].iloc[-1] + pd.Timedelta(days=1)
+                fig_hist.add_trace(go.Scatter(x=[next_day], y=[predicted_trm], mode='markers', name='Predicción', 
+                                              marker=dict(color='red', size=12, symbol='star')))
+                fig_hist.update_layout(title='Histórico de la TRM y Valor Predicho', xaxis_title='Fecha', yaxis_title='Valor (COP)')
+                st.plotly_chart(fig_hist, use_container_width=True)
 
-    st.markdown("---")
+        st.markdown("---")
 
-    # --- Sección de Desempeño del Modelo (Colapsable) ---
-    with st.expander("📊 Evaluar Desempeño de los Modelos"):
-        st.markdown("""
-        Aquí puedes ver qué tan precisos son los modelos. Dividimos los datos históricos en un conjunto de **entrenamiento (80%)** y uno de **prueba (20%)**. 
-        El modelo aprende de los datos de entrenamiento y luego intentamos predecir los datos de prueba para compararlos con los valores reales.
-        """)
-        
-        if st.button('Calcular Desempeño'):
-            with st.spinner('Evaluando el modelo...'):
-                if model_choice not in ['Prophet', 'LSTM']:
+        # --- Sección de Desempeño del Modelo ---
+        with st.expander("📊 Evaluar Desempeño del Modelo Seleccionado"):
+            if st.button('Calcular Desempeño del Modelo'):
+                with st.spinner('Evaluando...'):
                     train_data, test_data = train_test_split(data_featured, test_size=0.2, shuffle=False)
                     
-                    # Evaluar modelo TRM
-                    model_eval, features_eval = train_ml_model(train_data, model_choice, target='valor')
-                    X_test = test_data.shift(1).dropna()[features_eval]
-                    y_test = test_data.iloc[1:]['valor']
-                    predictions = model_eval.predict(X_test)
+                    if len(test_data) > 1:
+                        model_eval, features_eval = train_ml_model(train_data, model_choice, target='valor')
+                        X_test = test_data.shift(1).dropna()[features_eval]
+                        y_test = test_data.iloc[1:]['valor']
+                        y_test = y_test.tail(len(X_test))
 
-                    mae = mean_absolute_error(y_test, predictions)
-                    rmse = np.sqrt(mean_squared_error(y_test, predictions))
-                    mape = np.mean(np.abs((y_test - predictions) / y_test)) * 100
+                        predictions = model_eval.predict(X_test)
 
-                    st.subheader(f'Métricas de Desempeño para {model_choice}')
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("MAE (Error Absoluto Medio)", f"${mae:,.2f}", help="El error promedio en pesos.")
-                    c2.metric("RMSE (Raíz del Error Cuadrático)", f"${rmse:,.2f}", help="Similar al MAE pero penaliza más los errores grandes.")
-                    c3.metric("MAPE (Error Porcentual Absoluto)", f"{mape:.2f}%", help="El error promedio en términos de porcentaje.")
+                        mae = mean_absolute_error(y_test, predictions)
+                        rmse = np.sqrt(mean_squared_error(y_test, predictions))
+                        mape = mean_absolute_percentage_error(y_test, predictions) * 100
 
-                    # Gráfica de comparación
-                    fig_eval = go.Figure()
-                    fig_eval.add_trace(go.Scatter(x=test_data.iloc[1:]['fecha'], y=y_test, mode='lines', name='Valor Real'))
-                    fig_eval.add_trace(go.Scatter(x=test_data.iloc[1:]['fecha'], y=predictions, mode='lines', name='Predicción', line=dict(dash='dot')))
-                    fig_eval.update_layout(title='Comparación de Predicciones vs. Valores Reales (Datos de Prueba)',
-                                           xaxis_title='Fecha', yaxis_title='Valor (COP)')
-                    st.plotly_chart(fig_eval, use_container_width=True)
-                else:
-                    st.info(f"La evaluación de desempeño detallada para {model_choice} es más compleja y se implementará en futuras versiones. ¡Pero es uno de los modelos más potentes!")
+                        st.subheader(f'Métricas de Desempeño para {model_choice}')
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("MAE", f"${mae:,.2f}")
+                        c2.metric("RMSE", f"${rmse:,.2f}")
+                        c3.metric("MAPE", f"{mape:.2f}%")
+
+                        fig_eval = go.Figure()
+                        fig_eval.add_trace(go.Scatter(x=test_data.iloc[1:]['fecha'], y=y_test, mode='lines', name='Valor Real'))
+                        fig_eval.add_trace(go.Scatter(x=test_data.iloc[1:]['fecha'], y=predictions, mode='lines', name='Predicción', line=dict(dash='dot')))
+                        fig_eval.update_layout(title='Comparación Real vs. Predicción (Datos de Prueba)',
+                                               xaxis_title='Fecha', yaxis_title='Valor (COP)')
+                        st.plotly_chart(fig_eval, use_container_width=True)
+                    else:
+                        st.warning("No hay suficientes datos en el rango seleccionado para crear un conjunto de prueba. Por favor, elige un rango de fechas más amplio.")
 
 else:
     st.info('👈 Por favor, carga un archivo CSV para comenzar.')
