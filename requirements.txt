@@ -6,3 +6,6 @@ statsmodels
 prophet
 plotly
 holidays
+xgboost
+lightgbm
+tensorflow
